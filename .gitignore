@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec.bak
+build-out.txt
+config.json
+*.log
+ui-home.png
+ui-settings.png
+bar-*.png
+
+# Working notes for the machine this was built on: personal context, not
+# useful to anyone else.
+CLAUDE.md
