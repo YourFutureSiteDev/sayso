@@ -12,8 +12,8 @@ from tkinter import ttk
 
 # Deep, slightly blue-black rather than pure grey: pure grey reads as "unstyled
 # Windows", which is exactly the look this is trying to leave behind.
-BG = "#0e1014"
-SIDEBAR = "#131620"
+BG = "#07090c"
+SIDEBAR = "#090c11"
 PANEL = "#171a20"
 PANEL_HI = "#1e222a"
 LINE = "#272c35"
@@ -28,6 +28,12 @@ VIOLET = "#a78bfa"
 
 RECORDING = RED
 BUSY = AMBER
+
+# The tone of a flat glass panel, and the tint given to any widget placed on
+# one. The two must stay identical: Tk cannot make a widget translucent, so a
+# mismatch shows up as a grey chip floating on the panel.
+GLASS = "#1b202a"
+GLASS_RGB = (0x1b, 0x20, 0x2a)
 
 FONT = ("Segoe UI", 10)
 FONT_SMALL = ("Segoe UI", 9)
@@ -83,7 +89,12 @@ def apply(root: tk.Tk) -> ttk.Style:
                     padding=(12, 7), borderwidth=0, font=FONT_SMALL)
     style.map("Quiet.TButton", background=[("active", PANEL_HI)])
 
-    for name, bg in (("TCheckbutton", BG), ("Panel.TCheckbutton", PANEL)):
+    # Widgets placed on a glass canvas, tinted to the flat panel behind them.
+    style.configure("Glass.TLabel", background=GLASS, foreground=TEXT, font=FONT)
+    style.configure("Glass.TFrame", background=GLASS)
+
+    for name, bg in (("TCheckbutton", BG), ("Panel.TCheckbutton", PANEL),
+                     ("Glass.TCheckbutton", GLASS)):
         style.configure(name, background=bg, foreground=DIM, font=FONT)
         style.map(name, background=[("active", bg)], foreground=[("active", TEXT)],
                   indicatorcolor=[("selected", ACCENT), ("!selected", PANEL_HI)])

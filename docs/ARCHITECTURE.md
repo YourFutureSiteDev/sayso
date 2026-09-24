@@ -21,7 +21,7 @@ part.
 | `single.py` | One copy at a time, and the start-with-Windows entry. |
 | `app.py` | State machine: one dictation at a time, on a worker thread. |
 | `gui.py` | The window. |
-| `panels.py`, `theme.py` | Rounded cards and the styling. |
+| `glass.py`, `theme.py` | The frosted backdrop and panels, and the styling. |
 | `selftest.py` | Synthesises speech, scores the word error rate, tests typing. |
 
 ## Accuracy is a stack, not a setting
@@ -33,16 +33,19 @@ Removing any of these costs real accuracy:
 - **Beam search** (`beam_size=5`, `best_of=5`) rather than greedy decoding.
 - **Temperature fallback** 0.0 → 1.0: a pass that looks like a hallucination,
   judged by compression ratio and log probability, is retried hotter.
-- **`condition_on_previous_text=False`**. Left on, Whisper drags the previous
-  dictation into the next one and loops. Each press is independent.
+- **`condition_on_previous_text=True`**. Whisper works in 30-second windows,
+  and without the previous text it restarts cold at every boundary, which
+  wrecks grammar across the joins. The loop this can cause is caught by the
+  temperature fallback and the compression ratio check.
 - **A forced language**, so a short "yep" is never detected as Welsh.
 - **Silero VAD** trims silence. This is what stops Whisper inventing text
   during dead air.
 - **Peak normalisation** before decoding, capped at 8x. A desk mic at arm's
   length records well below full scale and Whisper is measurably worse on
   quiet audio.
-- **Vocabulary biasing**, fed as both the initial prompt and hotwords. The
-  single biggest win on domain-specific speech.
+- **Vocabulary biasing** through `hotwords` only, never `initial_prompt`. The
+  single biggest win on domain-specific speech, and the prompt route silently
+  truncates long dictations: see the trap below.
 
 ## The traps
 
@@ -133,3 +136,44 @@ harnesses produced confident false failures while this was built:
 
 Print the return values and the window handles before believing a negative
 result.
+
+## The glass
+
+Tk has no blur, no gradients, and no alpha between widgets, so the look is not
+widget styling. The whole backdrop is composited in PIL and pushed to a canvas
+as one image, with text and bars drawn as canvas items on top where Tk still
+renders fonts crisply.
+
+**The blur is free.** The aurora is drawn at about a tenth scale and upscaled
+with LANCZOS. That produces a soft gradient far faster than blurring at full
+size, and is the only reason it can animate: a full frame costs about 45 ms, so
+it drifts on its own slower clock while the numbers and the level meter run at
+30 fps.
+
+**One aurora for the whole window**, cropped per canvas, so the colour runs
+continuously from the rail into the content instead of stopping at the seam.
+A scrolled canvas moves its items but not the window, so panels are frosted
+where they currently appear rather than where they were placed.
+
+### Translucent panels and opaque widgets do not mix
+
+A frosted panel lets the drifting aurora through, so no fixed colour can match
+it. Any widget placed on one therefore reads as a grey chip floating on top,
+because Tk cannot make a widget translucent.
+
+So there are two kinds of panel:
+
+- **Home** is fully translucent. Nothing opaque sits on it: the hero text, the
+  stat numbers and the meter are all canvas items.
+- **Settings** uses flat panels with a glass rim (`frost(..., solid=...)`) and
+  tints every widget to exactly that colour. The glass still reads from the
+  backdrop showing between the panels.
+
+`theme.GLASS` and `theme.GLASS_RGB` must stay identical, and that is the whole
+reason they exist.
+
+### Colour is easy to overdo
+
+The first pass blended the blobs at 0.5 and looked like a light theme. The
+blobs are deep and desaturated, and blended at 0.28, because the frosted
+panels lighten everything again on top.

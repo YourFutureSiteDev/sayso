@@ -15,19 +15,23 @@ touches a widget.
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from datetime import datetime
 from tkinter import messagebox, ttk
 
-from . import panels, single, theme
+from . import glass, single, theme
 from .audio import list_devices
 from .config import CONFIG_PATH, DATA_DIR, Config
 from .history import History
+
+log = logging.getLogger(__name__)
 
 MODELS = [
     ("large-v3", "most accurate, 3.1 GB of VRAM"),
@@ -74,6 +78,14 @@ class SaysoWindow(tk.Tk):
         self._counts: dict[str, float] = {}
         self._targets: dict[str, float] = {}
         self._level = 0.0
+        self._glass_phase = 0.0
+        self._glass_dirty = True
+        self._glass_at = 0.0
+        self._panel_boxes: list = []
+        # Frosted panel rectangles per page, in that page's canvas coordinates.
+        self._page_boxes: dict[str, list] = {}
+        self._hero_text = "Getting ready"
+        self._hero_sub_text = "loading the model"
 
         self._build()
         self._pump()
@@ -109,6 +121,8 @@ class SaysoWindow(tk.Tk):
 
     def _build_rail(self) -> None:
         c = self.rail
+        # Created first so everything else draws over it.
+        self._rail_bg = c.create_image(0, 0, anchor="nw")
         c.create_text(26, 38, text="Sayso", anchor="w", fill=theme.TEXT,
                       font=("Segoe UI Semibold", 18))
         c.create_text(26, 62, text="speak, it types", anchor="w",
@@ -161,35 +175,56 @@ class SaysoWindow(tk.Tk):
                                     fill=theme.TEXT if name == key else theme.MUTED,
                                     font=theme.FONT_BOLD if name == key else theme.FONT)
         self._indicator_target = float(self._rail_items[key]["y"])
+        # The aurora is cropped per page, so it has to be recomposited on a
+        # switch rather than waiting for the next drift tick.
+        self._glass_dirty = True
         if key == "history":
             self._load_history()
+        if key == "settings" and not getattr(self, "_settings_drawn", False):
+            self.after(30, self._draw_settings)
 
     # ------------------------------------------------------------------ home
 
     def _build_home(self) -> None:
+        """One canvas for the whole page.
+
+        The hero text is a canvas item rather than a label because a ttk widget
+        paints a solid rectangle, and a solid rectangle over a moving aurora
+        looks like a hole in it. On the canvas the text sits directly on the
+        glass and Tk still renders the font properly.
+        """
         page = ttk.Frame(self.content)
         self.pages["home"] = page
 
-        self.hero = ttk.Label(page, text="Getting ready", style="Hero.TLabel")
-        self.hero.pack(anchor="w")
-        self.hero_sub = ttk.Label(page, text="loading the model", style="Muted.TLabel")
-        self.hero_sub.pack(anchor="w", pady=(4, 0))
-
-        self.home_canvas = tk.Canvas(page, bg=theme.BG, highlightthickness=0, bd=0,
-                                     height=330)
-        self.home_canvas.pack(fill="both", expand=True, pady=(22, 0))
+        self.home_canvas = tk.Canvas(page, bg=glass.BASE, highlightthickness=0, bd=0)
+        self.home_canvas.pack(fill="both", expand=True)
         self.home_canvas.bind("<Configure>", lambda _e: self._draw_home())
         self._home_drawn = False
+        self._hero_item = None
+        self._hero_sub_item = None
 
     def _draw_home(self) -> None:
-        """Lay the tiles out for the current width. Cheap enough to redo."""
+        """Lay the tiles out for the current width.
+
+        Only the text and the meter bars are canvas items. The panels
+        themselves are part of the glass image behind them, so they can be
+        genuinely translucent, which no Tk widget can be.
+        """
         c = self.home_canvas
         c.delete("all")
         width = max(c.winfo_width(), 420)
         gap = 14
         tile_w = (width - gap) // 2
         tile_h = 96
+        top = 118                     # room for the hero lines above the tiles
 
+        self._home_bg = c.create_image(0, 0, anchor="nw")
+        self._hero_item = c.create_text(2, 34, text=self._hero_text, anchor="w",
+                                        fill=theme.TEXT, font=theme.FONT_HERO)
+        self._hero_sub_item = c.create_text(4, 68, text=self._hero_sub_text,
+                                            anchor="w", fill=theme.DIM,
+                                            font=theme.FONT_SMALL)
+        self._panel_boxes = []
         self._tiles = {}
         specs = [
             ("words", "Words dictated", theme.ACCENT, 0, 0),
@@ -199,34 +234,108 @@ class SaysoWindow(tk.Tk):
         ]
         for key, label, colour, col, row in specs:
             x = col * (tile_w + gap)
-            y = row * (tile_h + gap)
-            panels.card(c, x, y, tile_w, tile_h, fill=theme.PANEL,
-                        outline=theme.LINE, bg=theme.BG, radius=14)
-            c.create_rectangle(x + 1, y + 18, x + 4, y + tile_h - 18,
+            y = top + row * (tile_h + gap)
+            self._panel_boxes.append((x, y, x + tile_w, y + tile_h, 16, 11))
+            c.create_rectangle(x + 16, y + 22, x + 19, y + tile_h - 22,
                                fill=colour, outline="")
-            value = c.create_text(x + 22, y + 38, text="0", anchor="w",
-                                  fill=theme.TEXT, font=theme.FONT_STAT)
-            c.create_text(x + 22, y + 68, text=label, anchor="w",
-                          fill=theme.MUTED, font=theme.FONT_SMALL)
-            self._tiles[key] = value
+            self._tiles[key] = c.create_text(x + 32, y + 40, text="0", anchor="w",
+                                             fill=theme.TEXT, font=theme.FONT_STAT)
+            c.create_text(x + 32, y + 70, text=label, anchor="w",
+                          fill=theme.DIM, font=theme.FONT_SMALL)
 
-        # Level meter, under the tiles.
-        meter_y = 2 * (tile_h + gap) + 8
-        panels.card(c, 0, meter_y, width, 84, fill=theme.PANEL,
-                    outline=theme.LINE, bg=theme.BG, radius=14)
-        c.create_text(22, meter_y + 22, text="MICROPHONE", anchor="w",
-                      fill=theme.MUTED, font=theme.FONT_LABEL)
+        meter_y = top + 2 * (tile_h + gap) + 8
+        self._panel_boxes.append((0, meter_y, width, meter_y + 84, 16, 11))
+        c.create_text(24, meter_y + 24, text="MICROPHONE", anchor="w",
+                      fill=theme.DIM, font=theme.FONT_LABEL)
         self._meter_bars = []
         bars = 42
-        span = width - 44
+        span = width - 48
         bw = max(2, (span - (bars - 1) * 4) // bars)
         for i in range(bars):
-            x = 22 + i * (bw + 4)
+            x = 24 + i * (bw + 4)
             self._meter_bars.append(
-                c.create_line(x, meter_y + 56, x, meter_y + 60,
+                c.create_line(x, meter_y + 58, x, meter_y + 62,
                               fill=theme.LINE, width=bw, capstyle="round"))
+        self._page_boxes["home"] = self._panel_boxes
         self._home_drawn = True
+        self._glass_dirty = True
         self._refresh_stats()
+
+    # ------------------------------------------------------------------ glass
+
+    def _render_glass(self) -> None:
+        """One aurora across the whole window, cropped to each canvas.
+
+        Rendered as a single image so the colour runs continuously from the
+        rail into the content rather than stopping at the seam, then frosted
+        panels are composited where the tiles sit.
+
+        Redrawn a few times a second, not every frame: a full frame costs
+        about 45 ms, and the drift is slow enough that nobody can tell.
+        """
+        from PIL import ImageTk
+
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 50 or h < 50:
+            return
+        image = glass.aurora(w, h, self._glass_phase, base=glass.BASE,
+                             blobs=glass.BLOBS)
+        glass.frost(image, (0, 0, RAIL_W, h), radius=0, alpha=7, border=20,
+                    lift=10)
+
+        canvas = {"home": getattr(self, "home_canvas", None),
+                  "settings": getattr(self, "settings_canvas", None)}.get(self._page)
+
+        # Panel boxes are in the page canvas's own coordinates, so they have to
+        # be shifted by where that canvas sits in the window before they are
+        # composited into the single shared aurora.
+        if canvas is not None:
+            ox, oy = self._canvas_origin(canvas)
+            # A scrolled canvas moves its items but not the window, so the
+            # panels have to be frosted where they currently appear, not where
+            # they were placed.
+            top = self._scroll_top(canvas)
+            for x0, y0, x1, y1, radius, alpha in self._page_boxes.get(self._page, []):
+                glass.frost(image, (ox + x0, oy + y0 - top,
+                                    ox + x1, oy + y1 - top),
+                            radius=radius, alpha=alpha or 11,
+                            # alpha 0 means a flat panel: pages with opaque
+                            # widgets on them need something the widgets can
+                            # match exactly.
+                            solid=theme.GLASS_RGB if alpha == 0 else None)
+
+        self._rail_img = ImageTk.PhotoImage(image.crop((0, 0, RAIL_W, h)))
+        self.rail.itemconfigure(self._rail_bg, image=self._rail_img)
+
+        item = {"home": getattr(self, "_home_bg", None),
+                "settings": getattr(self, "_settings_bg", None)}.get(self._page)
+        if canvas is not None and item is not None:
+            cw, ch = canvas.winfo_width(), canvas.winfo_height()
+            if cw > 1 and ch > 1:
+                ox, oy = self._canvas_origin(canvas)
+                self._page_img = ImageTk.PhotoImage(
+                    image.crop((ox, oy, ox + cw, oy + ch)))
+                canvas.itemconfigure(item, image=self._page_img)
+                # Pinned to the top of the viewport, not the top of the
+                # content, so the backdrop stays put while the page scrolls.
+                canvas.coords(item, 0, self._scroll_top(canvas))
+                canvas.tag_lower(item)
+
+    @staticmethod
+    def _scroll_top(canvas: tk.Canvas) -> int:
+        """How far the canvas is scrolled, in canvas coordinates."""
+        try:
+            return int(canvas.canvasy(0))
+        except tk.TclError:
+            return 0
+
+    def _canvas_origin(self, canvas: tk.Canvas) -> tuple[int, int]:
+        """Where a page canvas sits inside the window."""
+        try:
+            return (canvas.winfo_rootx() - self.winfo_rootx(),
+                    canvas.winfo_rooty() - self.winfo_rooty())
+        except tk.TclError:
+            return (RAIL_W + 26, 22)
 
     def _refresh_stats(self) -> None:
         """Set the count-up targets from the store, without jumping."""
@@ -299,45 +408,99 @@ class SaysoWindow(tk.Tk):
     # -------------------------------------------------------------- settings
 
     def _build_settings(self) -> None:
+        """Settings on the glass.
+
+        Headings are canvas text and the controls are placed on the canvas with
+        `create_window`, because a Frame filling the page would cover the
+        aurora and there is no way to make a Tk widget translucent. Only the
+        controls themselves are opaque, and they sit inside the frosted panels
+        drawn behind them.
+        """
         page = ttk.Frame(self.content)
         self.pages["settings"] = page
-        ttk.Label(page, text="Settings", style="Title.TLabel").pack(anchor="w")
+        c = tk.Canvas(page, bg=glass.BASE, highlightthickness=0, bd=0)
+        c.pack(fill="both", expand=True)
+        self.settings_canvas = c
 
-        box = self._section(page, "Dictation key",
-                            "Press once to start and once to stop. Holding it "
-                            "works too and ends when you let go.")
-        row = ttk.Frame(box, style="Panel.TFrame")
-        row.pack(fill="x")
-        self.hotkey_label = ttk.Label(row, text=self._pretty_key(self.cfg.hotkey),
-                                      style="Panel.TLabel", font=theme.FONT_BOLD)
-        self.hotkey_label.pack(side="left")
-        ttk.Button(row, text="Rebind", style="Quiet.TButton",
-                   command=self._rebind).pack(side="right")
-
-        box = self._section(page, "Microphone",
-                            "The wrong one costs more accuracy than any other "
-                            "setting here.")
         self.device_var = tk.StringVar(value=self._device_label(self.cfg.input_device))
-        ttk.Combobox(
-            box, textvariable=self.device_var, state="readonly",
-            values=["System default"] + [f"[{i}] {n}" for i, n, _c in self._devices],
-        ).pack(fill="x")
-        self.device_var.trace_add("write", self._mark_dirty)
-
-        box = self._section(page, "Model")
         self.model_var = tk.StringVar(value=self._model_label(self.cfg.model))
-        ttk.Combobox(box, textvariable=self.model_var, state="readonly",
-                     values=[f"{n} - {note}" for n, note in MODELS]).pack(fill="x")
-        self.model_var.trace_add("write", self._mark_dirty)
-
-        box = self._section(page, "Behaviour")
         self.bar_var = tk.BooleanVar(value=self.cfg.show_bar)
         self.autostart_var = tk.BooleanVar(value=single.autostart_enabled())
         self.beep_var = tk.BooleanVar(value=self.cfg.sound_feedback)
         self.space_var = tk.BooleanVar(value=self.cfg.trailing_space)
         self.fix_var = tk.BooleanVar(value=self.cfg.apply_corrections)
         self.vad_var = tk.BooleanVar(value=self.cfg.vad)
-        for var, label, command in (
+        self.device_var.trace_add("write", self._mark_dirty)
+        self.model_var.trace_add("write", self._mark_dirty)
+
+        # Not shown: rarely touched, but _collect still reads them.
+        self.idle_var = tk.StringVar(value=str(int(self.cfg.idle_unload_seconds // 60)))
+        self.beam_var = tk.StringVar(value=str(self.cfg.beam_size))
+
+        c.bind("<Configure>", lambda _e: self._draw_settings())
+        self._settings_drawn = False
+
+    def _draw_settings(self) -> None:
+        c = self.settings_canvas
+        c.delete("all")
+        width = max(c.winfo_width(), 460)
+        self._settings_bg = c.create_image(0, 0, anchor="nw")
+        boxes: list = []
+        y = 6
+
+        c.create_text(2, y + 16, text="Settings", anchor="w", fill=theme.TEXT,
+                      font=theme.FONT_TITLE)
+        y += 52
+
+        def heading(title: str, blurb: str = "") -> None:
+            nonlocal y
+            c.create_text(4, y, text=title.upper(), anchor="w", fill=theme.MUTED,
+                          font=theme.FONT_LABEL)
+            y += 18
+            if blurb:
+                c.create_text(4, y, text=blurb, anchor="nw", fill=theme.DIM,
+                              font=theme.FONT_SMALL, width=width - 20)
+                y += 16 * (1 + len(blurb) // 74)
+            y += 8
+
+        def panel(height: int) -> int:
+            """A frosted box, milkier than the ones on Home.
+
+            The controls placed inside it are opaque and tinted to one fixed
+            colour, so the panel has to be close to flat for them to blend. A
+            lightly frosted panel lets the aurora through and every checkbox
+            then reads as a grey chip sitting on top of it.
+            """
+            nonlocal y
+            boxes.append((0, y, width, y + height, 14, 0))
+            top = y
+            y += height + 22
+            return top
+
+        heading("Dictation key", "Press once to start and once to stop. Holding it "
+                                 "works too and ends when you let go.")
+        top = panel(52)
+        self.hotkey_label = ttk.Label(c, text=self._pretty_key(self.cfg.hotkey),
+                                      style="Glass.TLabel", font=theme.FONT_BOLD)
+        c.create_window(18, top + 26, window=self.hotkey_label, anchor="w")
+        c.create_window(width - 18, top + 26, anchor="e", window=ttk.Button(
+            c, text="Rebind", style="Quiet.TButton", command=self._rebind))
+
+        heading("Microphone", "The wrong one costs more accuracy than any other "
+                              "setting here.")
+        top = panel(56)
+        c.create_window(18, top + 28, anchor="w", width=width - 36, window=ttk.Combobox(
+            c, textvariable=self.device_var, state="readonly",
+            values=["System default"] + [f"[{i}] {n}" for i, n, _c in self._devices]))
+
+        heading("Model")
+        top = panel(56)
+        c.create_window(18, top + 28, anchor="w", width=width - 36, window=ttk.Combobox(
+            c, textvariable=self.model_var, state="readonly",
+            values=[f"{n} - {note}" for n, note in MODELS]))
+
+        heading("Behaviour")
+        rows = (
             (self.bar_var, "Show the bar while dictating", self._toggle_bar),
             (self.autostart_var, "Start Sayso when Windows starts",
              self._toggle_autostart),
@@ -346,19 +509,35 @@ class SaysoWindow(tk.Tk):
             (self.fix_var, "Fix the spelling of names (never changes your words)",
              self._mark_dirty),
             (self.vad_var, "Trim silence before transcribing", self._mark_dirty),
-        ):
-            ttk.Checkbutton(box, text=label, variable=var, style="Panel.TCheckbutton",
-                            command=command).pack(anchor="w", pady=2)
+        )
+        top = panel(26 * len(rows) + 22)
+        for i, (var, label, command) in enumerate(rows):
+            c.create_window(18, top + 22 + i * 26, anchor="w", window=ttk.Checkbutton(
+                c, text=label, variable=var, style="Glass.TCheckbutton",
+                command=command))
 
-        box = self._section(page, "Checks")
-        ttk.Button(box, text="Run the self test", style="Quiet.TButton",
-                   command=self._run_selftest).pack(side="left")
-        ttk.Button(box, text="Settings folder", style="Quiet.TButton",
-                   command=lambda: webbrowser.open(str(DATA_DIR))).pack(side="left", padx=8)
+        heading("Checks")
+        top = panel(56)
+        c.create_window(18, top + 28, anchor="w", window=ttk.Button(
+            c, text="Run the self test", style="Quiet.TButton",
+            command=self._run_selftest))
+        c.create_window(170, top + 28, anchor="w", window=ttk.Button(
+            c, text="Settings folder", style="Quiet.TButton",
+            command=lambda: webbrowser.open(str(DATA_DIR))))
 
-        # Kept for compatibility with _collect; not shown, rarely touched.
-        self.idle_var = tk.StringVar(value=str(int(self.cfg.idle_unload_seconds // 60)))
-        self.beam_var = tk.StringVar(value=str(self.cfg.beam_size))
+        self._page_boxes["settings"] = boxes
+        self._settings_drawn = True
+        self._glass_dirty = True
+
+        # The page is taller than the window, so it scrolls. Without this the
+        # last panel is simply cut off with no way to reach it.
+        c.configure(scrollregion=(0, 0, width, y + 10))
+        c.bind("<MouseWheel>", self._scroll_settings)
+        c.bind("<Enter>", lambda _e: c.focus_set())
+
+    def _scroll_settings(self, event) -> None:  # noqa: ANN001
+        self.settings_canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        self._glass_dirty = True
 
     def _section(self, parent: tk.Misc, title: str, blurb: str = "") -> ttk.Frame:
         ttk.Label(parent, text=title.upper(), style="Heading.TLabel").pack(
@@ -399,6 +578,19 @@ class SaysoWindow(tk.Tk):
         if self._home_drawn:
             self._tick_counts()
             self._tick_meter()
+
+        # The glass costs about 45 ms a frame, so it drifts on its own slower
+        # clock while the numbers and the meter keep running at 30.
+        now = time.monotonic()
+        if self._glass_dirty or now - self._glass_at > 0.14:
+            self._glass_at = now
+            self._glass_dirty = False
+            self._glass_phase += 0.05
+            try:
+                self._render_glass()
+            except Exception:
+                log.exception("glass render failed")
+
         self.after(33, self._tick)
 
     def _tick_counts(self) -> None:
@@ -458,8 +650,6 @@ class SaysoWindow(tk.Tk):
         self._destroy_bar()
         self.power.configure(text="Start listening")
         self._set_status("off", "idle")
-        self.hero.configure(text="Not listening")
-        self.hero_sub.configure(text="press Start listening to switch it back on")
 
     def _toggle_engine(self) -> None:
         self._stop_engine() if self.engine is not None else self._start_engine()
@@ -533,24 +723,28 @@ class SaysoWindow(tk.Tk):
 
     def _set_hero(self, text: str) -> None:
         key = self._pretty_key(self.cfg.hotkey)
-        if text.startswith("recording"):
-            self.hero.configure(text="Listening")
-            self.hero_sub.configure(text=f"press {key} again, or click the tick")
-        elif text.startswith("transcribing"):
-            self.hero.configure(text="Working it out")
-            self.hero_sub.configure(text="transcribing what you said")
-        elif text.startswith("loading"):
-            self.hero.configure(text="Getting ready")
-            self.hero_sub.configure(text="loading the model onto the graphics card")
-        elif text.startswith("typed"):
-            self.hero.configure(text="Typed it")
-            self.hero_sub.configure(text=text)
-        elif text.startswith(("nothing heard", "too short", "cancelled")):
-            self.hero.configure(text="Nothing to type")
-            self.hero_sub.configure(text=text)
-        elif text.startswith("ready"):
-            self.hero.configure(text="Ready")
-            self.hero_sub.configure(text=f"press {key} anywhere and talk")
+        lines = {
+            "recording": ("Listening", f"press {key} again, or click the tick"),
+            "transcribing": ("Working it out", "transcribing what you said"),
+            "loading": ("Getting ready", "loading the model onto the graphics card"),
+            "typed": ("Typed it", text),
+            "nothing heard": ("Nothing to type", text),
+            "too short": ("Nothing to type", text),
+            "cancelled": ("Thrown away", text),
+            "ready": ("Ready", f"press {key} anywhere and talk"),
+            "off": ("Not listening", "press Start listening to switch it back on"),
+        }
+        for prefix, (head, sub) in lines.items():
+            if text.startswith(prefix):
+                self._hero(head, sub)
+                return
+
+    def _hero(self, head: str, sub: str) -> None:
+        """Canvas text, so it sits on the glass rather than on a grey patch."""
+        self._hero_text, self._hero_sub_text = head, sub
+        if self._hero_item is not None:
+            self.home_canvas.itemconfigure(self._hero_item, text=head)
+            self.home_canvas.itemconfigure(self._hero_sub_item, text=sub)
 
     def _set_status(self, text: str, kind: str) -> None:
         self.rail.itemconfigure(self._rail_status, text=text)
