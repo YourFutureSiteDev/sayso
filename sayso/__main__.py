@@ -141,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--devices", action="store_true", help="list microphones")
     parser.add_argument("--file", type=Path, help="transcribe a wav file and print it")
+    parser.add_argument("--retry", action="store_true",
+                        help="re-transcribe the last recording with the current settings")
     parser.add_argument("--tray", action="store_true", help="tray icon only, no window")
     parser.add_argument("--console", action="store_true", help="no window, no tray")
     parser.add_argument("--self-test", action="store_true", help="end to end check")
@@ -158,6 +160,17 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_devices()
     if args.file:
         return cmd_file(args.file, cfg)
+    if args.retry:
+        last = DATA_DIR / "last-recording.wav"
+        if not last.is_file():
+            print("No saved recording yet. Dictate once, then try again.")
+            return 1
+        print(f"Re-running {last}\n"
+              f"  vad {cfg.vad_threshold} pad {cfg.vad_speech_pad_ms}ms  "
+              f"logprob {cfg.log_prob_threshold}  "
+              f"no_speech {cfg.no_speech_threshold}  "
+              f"context {cfg.condition_on_previous_text}\n")
+        return cmd_file(last, cfg)
     if args.self_test:
         return cmd_selftest(cfg)
     if args.console:
@@ -172,6 +185,11 @@ def main(argv: list[str] | None = None) -> int:
     if not single.claim():
         single.wake_existing()
         return 0
+
+    # Windows search only indexes the Start Menu, so an exe in a folder is
+    # invisible to it no matter what the file is called. Harmless if it is
+    # already there.
+    single.install_start_menu()
 
     from .gui import run
     return run()

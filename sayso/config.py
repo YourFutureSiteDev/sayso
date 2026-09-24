@@ -140,11 +140,16 @@ class Config:
     # looks like a hallucination. Costs nothing when the first pass is clean.
     temperature_fallback: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
     compression_ratio_threshold: float = 2.4
-    log_prob_threshold: float = -1.0
-    no_speech_threshold: float = 0.6
-    # Off, because each dictation is independent. Left on, Whisper drags the
-    # previous sentence into the next one and loops.
-    condition_on_previous_text: bool = False
+    # These two DISCARD segments, they do not just score them. Set tight, whole
+    # sentences vanish with no error and the result reads like a summary of
+    # what you said. Loose enough that only genuine silence is dropped.
+    log_prob_threshold: float = -1.6
+    no_speech_threshold: float = 0.85
+    # On: Whisper works in 30-second windows, and without the previous text it
+    # restarts cold at every boundary, which wrecks grammar across the joins in
+    # a long dictation. The loop this can cause is already caught by the
+    # temperature fallback and the compression ratio check above.
+    condition_on_previous_text: bool = True
 
     # --- audio ------------------------------------------------------------
     sample_rate: int = 16_000
@@ -158,17 +163,28 @@ class Config:
 
     # --- voice activity ---------------------------------------------------
     vad: bool = True
-    vad_threshold: float = 0.45
-    vad_min_speech_ms: int = 120
-    vad_min_silence_ms: int = 350
-    vad_speech_pad_ms: int = 220
+    # Tuned to keep speech rather than to cut silence tightly. A high threshold
+    # or a short pad clips the quiet start and end of words, and a short
+    # silence gap splits a sentence mid-clause, both of which read as the app
+    # "simplifying" what was said when it is really losing it.
+    vad_threshold: float = 0.30
+    vad_min_speech_ms: int = 80
+    vad_min_silence_ms: int = 700
+    vad_speech_pad_ms: int = 400
+
+    # Keep the raw audio of the last dictation, so a bad result can actually be
+    # re-run through different settings instead of guessed at. One file, always
+    # overwritten, never uploaded.
+    keep_last_recording: bool = True
 
     # --- output -----------------------------------------------------------
     apply_corrections: bool = True
     # Verbatim by default: no filler stripping, no rewriting.
     strip_fillers: bool = False
     trailing_space: bool = True
-    type_delay: float = 0.004
+    # Zero: typing is batched now, so there is no per-character gap to tune.
+    # Raise it only if an app cannot keep up with a burst.
+    type_delay: float = 0.0
     sound_feedback: bool = True
 
     # --- floating bar -----------------------------------------------------
@@ -182,7 +198,21 @@ class Config:
 
     @property
     def initial_prompt(self) -> str:
-        """Prior text the decoder conditions on. Biases spelling of the names."""
+        """DO NOT FEED THIS TO THE DECODER. Kept only for reference.
+
+        This used to be passed as `initial_prompt`, and it silently truncated
+        long dictations. Whisper treats the prompt as *prior text*, so a
+        hundred comma-separated nouns convince it that it is still writing a
+        list, and it stops early at the first sentence boundary.
+
+        Measured on one real 14-second recording, same audio both ways:
+
+            initial_prompt + hotwords ... 12 words
+            hotwords only .............. 33 words
+
+        Vocabulary biasing belongs in `hotwords`, which is built for it and
+        does not pollute the context. See `transcribe.py`.
+        """
         return (
             "The following is clear dictation by an Australian web developer. "
             "It may mention: " + ", ".join(self.vocabulary) + "."
@@ -210,12 +240,25 @@ class Config:
                 setattr(cfg, key, value)
         return cfg
 
+    # Only these are written to config.json. Everything else stays a code
+    # default, so improving one actually reaches people.
+    #
+    # The first version of this dumped every field. That pins the tuning
+    # values of the day into the file, and every later fix is then silently
+    # overridden by a config the user never chose to write. It cost two
+    # debugging sessions before anyone noticed.
+    TEMPLATE_KEYS = (
+        "hotkey", "input_device", "model", "sound_feedback", "trailing_space",
+        "apply_corrections", "show_bar", "vad", "keep_history_days",
+        "keep_last_recording", "idle_unload_seconds",
+    )
+
     def write_template(self) -> None:
         """Write config.json on first run so the settings are discoverable."""
         if CONFIG_PATH.exists():
             return
-        data = asdict(self)
-        data["temperature_fallback"] = list(self.temperature_fallback)
+        full = asdict(self)
+        data = {k: full[k] for k in self.TEMPLATE_KEYS}
         # Emptied in the template: the built-in lists always apply, and what
         # goes here is merged on top of them.
         data["vocabulary"] = []

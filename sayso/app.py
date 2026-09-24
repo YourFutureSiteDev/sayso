@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from .audio import Recorder, normalise
+from .audio import Recorder, normalise, save_wav
 from .config import Config
 from .focus import Target
 from .history import History
@@ -156,6 +156,8 @@ class Sayso:
     def _handle(self, audio, audio_seconds: float) -> None:
         started = time.monotonic()
         audio = normalise(audio, self.cfg.target_peak, self.cfg.max_gain)
+        if self.cfg.keep_last_recording:
+            save_wav(audio, self.cfg.sample_rate)
         raw = self.transcriber.transcribe(audio)
         text = finalise(
             raw,

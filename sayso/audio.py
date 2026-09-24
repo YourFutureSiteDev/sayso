@@ -106,6 +106,31 @@ def normalise(audio: np.ndarray, target_peak: float = 0.85, max_gain: float = 8.
     return np.clip(audio * gain, -1.0, 1.0)
 
 
+def save_wav(audio: np.ndarray, sample_rate: int, path: "Path | None" = None) -> "Path":
+    """Keep the last recording so a bad result can be re-run, not guessed at.
+
+    Always the same file, always overwritten. It never leaves the machine, and
+    `keep_last_recording` in config.json turns it off.
+    """
+    import wave
+    from pathlib import Path as _Path
+
+    from .config import DATA_DIR
+
+    target = _Path(path) if path else DATA_DIR / "last-recording.wav"
+    pcm = np.clip(audio, -1.0, 1.0)
+    pcm = (pcm * 32767).astype(np.int16)
+    try:
+        with wave.open(str(target), "wb") as fh:
+            fh.setnchannels(1)
+            fh.setsampwidth(2)
+            fh.setframerate(sample_rate)
+            fh.writeframes(pcm.tobytes())
+    except OSError:
+        pass
+    return target
+
+
 def list_devices() -> list[tuple[int, str, int]]:
     """(index, name, max input channels) for every device that can record."""
     out = []

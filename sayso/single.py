@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
+import subprocess
 import sys
 import winreg
 from ctypes import wintypes
@@ -74,6 +76,44 @@ def _command() -> str:
         return f'"{sys.executable}"'
     root = Path(__file__).resolve().parent.parent
     return f'"{sys.executable}" -m sayso'
+
+
+def start_menu_path() -> Path:
+    base = os.environ.get("APPDATA", "")
+    return (Path(base) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+            / "Sayso.lnk")
+
+
+def install_start_menu() -> bool:
+    """Put a shortcut in the Start Menu so Windows search can find it.
+
+    Windows only indexes what is in the Start Menu; an exe sitting in a folder
+    is invisible to search no matter what it is called. Creating a .lnk needs
+    COM, so this goes through PowerShell rather than adding pywin32 for one
+    call.
+    """
+    if not getattr(sys, "frozen", False):
+        return False            # a dev checkout has nothing worth pinning
+    link = start_menu_path()
+    if link.is_file():
+        return True
+    target = sys.executable
+    script = (
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('%s'); "
+        "$s.TargetPath = '%s'; "
+        "$s.WorkingDirectory = '%s'; "
+        "$s.Description = 'Local voice dictation'; "
+        "$s.Save()" % (link, target, str(Path(target).parent))
+    )
+    try:
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return done.returncode == 0 and link.is_file()
+    except (OSError, subprocess.SubprocessError):
+        log.exception("could not create the Start Menu shortcut")
+        return False
 
 
 def autostart_enabled() -> bool:

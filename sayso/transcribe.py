@@ -122,7 +122,12 @@ class Transcriber:
             log_prob_threshold=cfg.log_prob_threshold,
             no_speech_threshold=cfg.no_speech_threshold,
             condition_on_previous_text=cfg.condition_on_previous_text,
-            initial_prompt=cfg.initial_prompt,
+            # No initial_prompt, deliberately. Whisper reads it as prior text,
+            # so a list of nouns makes it behave as though it is still writing
+            # a list and it stops at the first sentence boundary. On one real
+            # 14-second recording that cost 21 of 33 words. `hotwords` is the
+            # mechanism built for vocabulary biasing and does not do this.
+            initial_prompt=None,
             hotwords=" ".join(cfg.vocabulary) if cfg.vocabulary else None,
             vad_filter=cfg.vad,
             vad_parameters=vad_params,
